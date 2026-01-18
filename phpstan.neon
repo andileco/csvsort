@@ -1,0 +1,15 @@
+parameters:
+    level: max
+    paths:
+        - src
+    
+    # Report unused suppressions
+    reportUnmatchedIgnoredErrors: true
+    
+    # Strict rules
+    checkMissingIterableValueType: true
+    checkGenericClassInNonGenericObjectType: true
+    
+    # Ignore third-party issues
+    excludePaths:
+        - vendor
