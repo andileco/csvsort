@@ -34,6 +34,7 @@ echo "=== Example 1: Sort by name (ascending) ===\n";
 $reader = Reader::createFromPath($sampleFile, 'r');
 $reader->setHeaderOffset(0);
 
+// Default configuration (Chunk size: 5000 rows, Merge Factor: 10)
 $sorter = new ExternalSorter();
 $sorted = $sorter->sort($reader, 'name');
 
@@ -77,7 +78,31 @@ foreach ($sorted as $record) {
 }
 echo "\n";
 
+// Example 4: High Performance Configuration (For Large Files)
+echo "=== Example 4: Large File Configuration ===\n";
+$reader = Reader::createFromPath($sampleFile, 'r');
+$reader->setHeaderOffset(0);
+
+// Use larger chunks and higher merge factor to reduce Disk I/O on massive files
+$sorter = new ExternalSorter([
+    'chunk_size' => 50000, // Process 50k rows at a time (vs default 5k)
+    'merge_factor' => 50,  // Merge 50 temp files at once (vs default 10)
+    'temp_dir' => sys_get_temp_dir(),
+]);
+
+$sorted = $sorter->sort($reader, 'name');
+
+echo "Sorted using optimized large-file settings.\n";
+foreach ($sorted as $record) {
+    // Just printing first match to prove it works
+    echo "First record: {$record['name']}\n";
+    break;
+}
+echo "\n";
+
 // Clean up
-unlink($sampleFile);
+if (file_exists($sampleFile)) {
+    unlink($sampleFile);
+}
 
 echo "Done! Check the output above.\n";
