@@ -14,13 +14,15 @@ use League\Csv\Writer;
 use League\Csv\TabularDataReader;
 
 /**
- * External merge sort implementation for large CSV files.
+ * External merge sort implementation for large CSV files with hybrid in-memory support.
  */
 class ExternalSorter
 {
   private readonly string $tempDir;
   private readonly int $mergeFactor;
   private readonly int $chunkSize;
+  private readonly int $memorySortThreshold;
+  private readonly ?int $inputSizeHint;
 
   private SortMetrics $metrics;
 
@@ -28,7 +30,13 @@ class ExternalSorter
   private array $tempFiles = [];
 
   /**
-   * @param array{chunk_size?: int, temp_dir?: string, merge_factor?: int} $config
+   * @param array{
+   * chunk_size?: int,
+   * temp_dir?: string,
+   * merge_factor?: int,
+   * memory_sort_threshold?: int,
+   * input_size?: int
+   * } $config
    */
   public function __construct(array $config = [])
   {
@@ -36,6 +44,10 @@ class ExternalSorter
     $this->chunkSize = $config['chunk_size'] ?? 50000;
     $this->tempDir = $config['temp_dir'] ?? sys_get_temp_dir();
     $this->mergeFactor = $config['merge_factor'] ?? 50;
+
+    // Default to 20MB threshold for in-memory sorting
+    $this->memorySortThreshold = $config['memory_sort_threshold'] ?? 20 * 1024 * 1024;
+    $this->inputSizeHint = $config['input_size'] ?? null;
 
     $this->validateConfiguration();
     $this->metrics = new SortMetrics();
@@ -60,7 +72,6 @@ class ExternalSorter
     // Capture headers.
     $headers = $input->getHeader();
     if (empty($headers)) {
-      // If input has no explicit header offset, try to fetch 0th row.
       if ($input instanceof Reader && $input->getHeaderOffset() === null) {
         $input->setHeaderOffset(0);
         $headers = $input->getHeader();
@@ -73,6 +84,53 @@ class ExternalSorter
 
     $this->verifyColumnsExist($headers, $sortColumns);
 
+    // DECISION: Memory Sort vs External Sort
+    if ($this->shouldUseMemorySort($input)) {
+      return $this->sortInMemory($input, $sortColumns, $headers);
+    }
+
+    return $this->sortExternally($input, $sortColumns, $headers);
+  }
+
+  /**
+   * Performs the sort entirely in memory using PHP's usort.
+   */
+  private function sortInMemory(
+    TabularDataReader $input,
+    array $sortColumns,
+    array $headers
+  ): Reader {
+    // Load all records into memory
+    $records = [];
+    foreach ($input->getRecords() as $record) {
+      $records[] = $record;
+    }
+
+    // Sort in RAM
+    usort($records, fn($a, $b) => $this->compareRecords($a, $b, $sortColumns));
+
+    // Write to a memory stream
+    $csv = Writer::createFromStream(fopen('php://temp', 'r+'));
+    $csv->insertOne($headers);
+    $csv->insertAll($records);
+
+    // Return a Reader for the memory stream
+    $reader = Reader::createFromStream($csv->getStream());
+    $reader->setHeaderOffset(0);
+
+    $this->metrics->finish(); // Metrics might need adjustment for memory sort
+
+    return $reader;
+  }
+
+  /**
+   * Performs the original external merge sort logic.
+   */
+  private function sortExternally(
+    TabularDataReader $input,
+    array $sortColumns,
+    array $headers
+  ): Reader {
     try {
       // Split (Pass headers to preserve them in chunks).
       $chunkFiles = $this->createSortedChunks($input, $sortColumns, $headers);
@@ -81,7 +139,6 @@ class ExternalSorter
       $sortedFile = $this->mergeChunks($chunkFiles, $sortColumns, $headers);
 
       // Return Reader.
-      // Use fopen with 'from' to ensure it reads the FILE, not the string path.
       $stream = fopen($sortedFile, 'r');
       $sortedReader = Reader::from($stream);
       $sortedReader->setHeaderOffset(0);
@@ -92,6 +149,40 @@ class ExternalSorter
     } finally {
       $this->cleanup();
     }
+  }
+
+  /**
+   * Determines if we should sort in memory based on size threshold.
+   */
+  private function shouldUseMemorySort(TabularDataReader $input): bool
+  {
+    $size = $this->inputSizeHint;
+
+    // Try to detect size from the input stream if no hint provided
+    if ($size === null && $input instanceof Reader) {
+      try {
+        // Access the internal stream to check stats
+        $reflection = new \ReflectionClass($input);
+        // Note: relying on internal implementation details of League\Csv 
+        // might be risky, but accessing the stream resource is possible 
+        // if the Reader exposes it. 
+        // A safer way for League\Csv Reader is usually via its stream usage.
+
+        // Fallback: We simply cannot reliably know the size of a generic 
+        // TabularDataReader (like a ResultSet) without iterating it.
+        // If specific Stream access is available:
+        // $stats = fstat($resource); $size = $stats['size'];
+      } catch (\Throwable $e) {
+        // Ignore detection errors
+      }
+    }
+
+    // If we still don't know the size, assume it's large (safety first)
+    if ($size === null) {
+      return false;
+    }
+
+    return $size < $this->memorySortThreshold;
   }
 
   public function getMetrics(): SortMetrics
