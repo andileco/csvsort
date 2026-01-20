@@ -7,29 +7,75 @@ namespace Andileco\CsvSort;
 use Andileco\CsvSort\Comparator\ComparatorInterface;
 use Andileco\CsvSort\Comparator\StringComparator;
 use Andileco\CsvSort\Exception\ColumnNotFoundException;
+use Andileco\CsvSort\Exception\CsvSortException;
 use Andileco\CsvSort\Exception\InvalidConfigurationException;
 use Andileco\CsvSort\Exception\IoException;
+use Andileco\CsvSort\Exception\MemoryLimitException;
 use League\Csv\Reader;
 use League\Csv\Writer;
 use League\Csv\TabularDataReader;
 
 /**
- * External merge sort implementation for large CSV files with hybrid in-memory support.
+ * External merge sort implementation for large CSV files.
+ *
+ * This implementation includes a hybrid strategy that will sort in-memory
+ * if the file size is below a configured threshold, falling back to disk-based
+ * merge sort for larger datasets.
  */
-class ExternalSorter
-{
+class ExternalSorter {
+
+  /**
+   * The directory for temporary files.
+   *
+   * @var string
+   */
   private readonly string $tempDir;
+
+  /**
+   * The number of chunks to merge at once.
+   *
+   * @var int
+   */
   private readonly int $mergeFactor;
+
+  /**
+   * The number of rows per chunk.
+   *
+   * @var int
+   */
   private readonly int $chunkSize;
+
+  /**
+   * The threshold in bytes for in-memory sorting.
+   *
+   * @var int
+   */
   private readonly int $memorySortThreshold;
+
+  /**
+   * A hint for the input size (in bytes) if the source is not a file.
+   *
+   * @var int|null
+   */
   private readonly ?int $inputSizeHint;
 
+  /**
+   * Metrics for the sort operation.
+   *
+   * @var \Andileco\CsvSort\SortMetrics
+   */
   private SortMetrics $metrics;
 
-  /** @var list<string> */
+  /**
+   * List of temporary files created.
+   *
+   * @var list<string>
+   */
   private array $tempFiles = [];
 
   /**
+   * Constructs a new ExternalSorter.
+   *
    * @param array{
    * chunk_size?: int,
    * temp_dir?: string,
@@ -37,29 +83,37 @@ class ExternalSorter
    * memory_sort_threshold?: int,
    * input_size?: int
    * } $config
+   *   The configuration array.
    */
-  public function __construct(array $config = [])
-  {
-    // Performance: Sort 5000 rows at a time (approx 1-5MB chunk)
+  public function __construct(array $config = []) {
+    // Sort 50000 rows at a time (approx 1-5MB chunk).
     $this->chunkSize = $config['chunk_size'] ?? 50000;
     $this->tempDir = $config['temp_dir'] ?? sys_get_temp_dir();
     $this->mergeFactor = $config['merge_factor'] ?? 50;
 
-    // Default to 20MB threshold for in-memory sorting
+    // Default to 20MB threshold for in-memory sorting.
     $this->memorySortThreshold = $config['memory_sort_threshold'] ?? 20 * 1024 * 1024;
-    $this->inputSizeHint = $config['input_size'] ?? null;
+    $this->inputSizeHint = $config['input_size'] ?? NULL;
 
     $this->validateConfiguration();
     $this->metrics = new SortMetrics();
   }
 
   /**
-   * Sort a CSV file (or ResultSet) by one or more columns
+   * Sort a CSV file (or ResultSet) by one or more columns.
    *
-   * @param TabularDataReader $input The input (Reader or ResultSet)
-   * @param string|SortColumn|array $columns Column(s) to sort by
-   * @param ComparatorInterface|null $comparator Comparator for single column sort
-   * @return Reader A reader for the sorted CSV
+   * @param \League\Csv\TabularDataReader $input
+   *   The input (Reader or ResultSet).
+   * @param string|\Andileco\CsvSort\SortColumn|array $columns
+   *   Column(s) to sort by.
+   * @param \Andileco\CsvSort\Comparator\ComparatorInterface|null $comparator
+   *   Comparator for single column sort.
+   *
+   * @return \League\Csv\Reader
+   *   A reader for the sorted CSV.
+   *
+   * @throws \Andileco\CsvSort\Exception\InvalidConfigurationException
+   * @throws \Andileco\CsvSort\Exception\ColumnNotFoundException
    */
   public function sort(
     TabularDataReader $input,
@@ -67,12 +121,13 @@ class ExternalSorter
     ?ComparatorInterface $comparator = null,
   ): Reader {
     $this->metrics = new SortMetrics();
-    $sortColumns = $this->normalizeSortColumns($columns, $comparator);
+    $sort_columns = $this->normalizeSortColumns($columns, $comparator);
 
     // Capture headers.
     $headers = $input->getHeader();
     if (empty($headers)) {
-      if ($input instanceof Reader && $input->getHeaderOffset() === null) {
+      // If input has no explicit header offset, try to fetch 0th row.
+      if ($input instanceof Reader && $input->getHeaderOffset() === NULL) {
         $input->setHeaderOffset(0);
         $headers = $input->getHeader();
       }
@@ -82,124 +137,159 @@ class ExternalSorter
       }
     }
 
-    $this->verifyColumnsExist($headers, $sortColumns);
+    $this->verifyColumnsExist($headers, $sort_columns);
 
-    // DECISION: Memory Sort vs External Sort
+    // Check if we should sort in memory or on disk.
     if ($this->shouldUseMemorySort($input)) {
-      return $this->sortInMemory($input, $sortColumns, $headers);
+      return $this->sortInMemory($input, $sort_columns, $headers);
     }
 
-    return $this->sortExternally($input, $sortColumns, $headers);
+    return $this->sortExternally($input, $sort_columns, $headers);
   }
 
   /**
-   * Performs the sort entirely in memory using PHP's usort.
+   * Gets the sort metrics.
+   *
+   * @return \Andileco\CsvSort\SortMetrics
+   *   The metrics object.
    */
-  private function sortInMemory(
-    TabularDataReader $input,
-    array $sortColumns,
-    array $headers
-  ): Reader {
-    // Load all records into memory
-    $records = [];
-    foreach ($input->getRecords() as $record) {
-      $records[] = $record;
-    }
-
-    // Sort in RAM
-    usort($records, fn($a, $b) => $this->compareRecords($a, $b, $sortColumns));
-
-    // Write to a memory stream
-    $csv = Writer::createFromStream(fopen('php://temp', 'r+'));
-    $csv->insertOne($headers);
-    $csv->insertAll($records);
-
-    // Return a Reader for the memory stream
-    $reader = Reader::createFromStream($csv->getStream());
-    $reader->setHeaderOffset(0);
-
-    $this->metrics->finish(); // Metrics might need adjustment for memory sort
-
-    return $reader;
-  }
-
-  /**
-   * Performs the original external merge sort logic.
-   */
-  private function sortExternally(
-    TabularDataReader $input,
-    array $sortColumns,
-    array $headers
-  ): Reader {
-    try {
-      // Split (Pass headers to preserve them in chunks).
-      $chunkFiles = $this->createSortedChunks($input, $sortColumns, $headers);
-
-      // Merge (Pass headers to write them to final output).
-      $sortedFile = $this->mergeChunks($chunkFiles, $sortColumns, $headers);
-
-      // Return Reader.
-      $stream = fopen($sortedFile, 'r');
-      $sortedReader = Reader::from($stream);
-      $sortedReader->setHeaderOffset(0);
-
-      $this->metrics->finish();
-
-      return $sortedReader;
-    } finally {
-      $this->cleanup();
-    }
+  public function getMetrics(): SortMetrics {
+    return $this->metrics;
   }
 
   /**
    * Determines if we should sort in memory based on size threshold.
+   *
+   * @param \League\Csv\TabularDataReader $input
+   *   The input data.
+   *
+   * @return bool
+   *   TRUE if we should sort in memory, FALSE otherwise.
    */
-  private function shouldUseMemorySort(TabularDataReader $input): bool
-  {
+  private function shouldUseMemorySort(TabularDataReader $input): bool {
     $size = $this->inputSizeHint;
 
-    // Try to detect size from the input stream if no hint provided
-    if ($size === null && $input instanceof Reader) {
+    // Try to detect size from the input stream if no hint provided.
+    // We can only reliably check size if it's a Reader with a stream.
+    if ($size === NULL && $input instanceof Reader) {
       try {
-        // Access the internal stream to check stats
-        $reflection = new \ReflectionClass($input);
-        // Note: relying on internal implementation details of League\Csv 
-        // might be risky, but accessing the stream resource is possible 
-        // if the Reader exposes it. 
-        // A safer way for League\Csv Reader is usually via its stream usage.
-
-        // Fallback: We simply cannot reliably know the size of a generic 
-        // TabularDataReader (like a ResultSet) without iterating it.
-        // If specific Stream access is available:
-        // $stats = fstat($resource); $size = $stats['size'];
-      } catch (\Throwable $e) {
-        // Ignore detection errors
+        // Warning: This presumes access to the underlying path/stream.
+        // league\csv Readers usually wrap a stream resource.
+        $path = $input->getPathname();
+        if ($path && file_exists($path)) {
+          $size = filesize($path);
+        }
+      }
+      catch (\Throwable $e) {
+        // Ignore detection errors and fall back to external sort.
       }
     }
 
-    // If we still don't know the size, assume it's large (safety first)
-    if ($size === null) {
-      return false;
+    // If we still don't know the size, assume it's large (safety first).
+    if ($size === NULL || $size === FALSE) {
+      return FALSE;
     }
 
     return $size < $this->memorySortThreshold;
   }
 
-  public function getMetrics(): SortMetrics
-  {
-    return $this->metrics;
+  /**
+   * Performs the sort entirely in memory using PHP's usort.
+   *
+   * @param \League\Csv\TabularDataReader $input
+   *   The input data.
+   * @param array $sort_columns
+   *   The normalized sort columns.
+   * @param array $headers
+   *   The headers.
+   *
+   * @return \League\Csv\Reader
+   *   The sorted reader.
+   */
+  private function sortInMemory(TabularDataReader $input, array $sort_columns, array $headers): Reader {
+    // Load all records into memory.
+    // Note: getRecords returns an iterator, iterator_to_array pulls them all.
+    $records = iterator_to_array($input->getRecords());
+
+    // Sort in RAM.
+    usort($records, fn($a, $b) => $this->compareRecords($a, $b, $sort_columns));
+
+    // Write to a memory stream.
+    $csv = Writer::createFromStream(fopen('php://temp', 'r+'));
+    $csv->insertOne($headers);
+    $csv->insertAll($records);
+
+    // Return a Reader for the memory stream.
+    // The stream is already open, so we create from it directly.
+    $reader = Reader::createFromStream($csv->getStream());
+    $reader->setHeaderOffset(0);
+
+    // Manually set metrics for consistency.
+    $this->metrics->recordsProcessed = count($records);
+    $this->metrics->finish();
+
+    return $reader;
   }
 
+  /**
+   * Performs the external merge sort logic.
+   *
+   * @param \League\Csv\TabularDataReader $input
+   *   The input data.
+   * @param array $sort_columns
+   *   The normalized sort columns.
+   * @param array $headers
+   *   The headers.
+   *
+   * @return \League\Csv\Reader
+   *   The sorted reader.
+   */
+  private function sortExternally(TabularDataReader $input, array $sort_columns, array $headers): Reader {
+    try {
+      // Split (Pass headers to preserve them in chunks).
+      $chunk_files = $this->createSortedChunks($input, $sort_columns, $headers);
+
+      // Merge (Pass headers to write them to final output).
+      $sorted_file = $this->mergeChunks($chunk_files, $sort_columns, $headers);
+
+      // Return Reader.
+      // Use fopen with 'r' to ensure it reads the FILE.
+      $stream = fopen($sorted_file, 'r');
+      $sorted_reader = Reader::from($stream);
+      $sorted_reader->setHeaderOffset(0);
+
+      $this->metrics->finish();
+
+      return $sorted_reader;
+    }
+    finally {
+      $this->cleanup();
+    }
+  }
+
+  /**
+   * Normalizes the sort columns.
+   *
+   * @param string|\Andileco\CsvSort\SortColumn|array $columns
+   *   The columns input.
+   * @param \Andileco\CsvSort\Comparator\ComparatorInterface|null $comparator
+   *   The comparator.
+   *
+   * @return array
+   *   The normalized columns.
+   */
   private function normalizeSortColumns(
     string|SortColumn|array $columns,
     ?ComparatorInterface $comparator,
   ): array {
     if (is_string($columns)) {
-      return [new SortColumn(
-        $columns,
-        SortDirection::ASC,
-        $comparator ?? new StringComparator(),
-      )];
+      return [
+        new SortColumn(
+          $columns,
+          SortDirection::ASC,
+          $comparator ?? new StringComparator(),
+        ),
+      ];
     }
     if ($columns instanceof SortColumn) {
       return [$columns];
@@ -210,21 +300,42 @@ class ExternalSorter
     return $columns;
   }
 
-  private function verifyColumnsExist(array $headers, array $sortColumns): void
-  {
-    foreach ($sortColumns as $sortColumn) {
-      if (!in_array($sortColumn->name, $headers, true)) {
+  /**
+   * Verifies that the sort columns exist in the headers.
+   *
+   * @param array $headers
+   *   The CSV headers.
+   * @param array $sort_columns
+   *   The sort columns.
+   *
+   * @throws \Andileco\CsvSort\Exception\ColumnNotFoundException
+   */
+  private function verifyColumnsExist(array $headers, array $sort_columns): void {
+    foreach ($sort_columns as $sort_column) {
+      if (!in_array($sort_column->name, $headers, TRUE)) {
         throw new ColumnNotFoundException(
-          "Column '{$sortColumn->name}' not found in CSV. Available: " .
+          "Column '{$sort_column->name}' not found in CSV. Available: " .
           implode(', ', $headers)
         );
       }
     }
   }
 
-  private function createSortedChunks(TabularDataReader $input, array $sortColumns, array $headers): array
-  {
-    $chunkFiles = [];
+  /**
+   * Creates sorted chunks from the input.
+   *
+   * @param \League\Csv\TabularDataReader $input
+   *   The input data.
+   * @param array $sort_columns
+   *   The sort columns.
+   * @param array $headers
+   *   The headers.
+   *
+   * @return array
+   *   The list of chunk files.
+   */
+  private function createSortedChunks(TabularDataReader $input, array $sort_columns, array $headers): array {
+    $chunk_files = [];
     $chunk = [];
     $count = 0;
 
@@ -234,58 +345,94 @@ class ExternalSorter
       $this->metrics->recordsProcessed++;
 
       if ($count >= $this->chunkSize) {
-        $chunkFiles[] = $this->writeSortedChunk($chunk, $sortColumns, $headers);
+        $chunk_files[] = $this->writeSortedChunk($chunk, $sort_columns, $headers);
         $chunk = [];
         $count = 0;
       }
     }
 
     if (!empty($chunk)) {
-      $chunkFiles[] = $this->writeSortedChunk($chunk, $sortColumns, $headers);
+      $chunk_files[] = $this->writeSortedChunk($chunk, $sort_columns, $headers);
     }
 
-    return $chunkFiles;
+    return $chunk_files;
   }
 
-  private function writeSortedChunk(array $chunk, array $sortColumns, array $headers): string
-  {
-    usort($chunk, fn($a, $b) => $this->compareRecords($a, $b, $sortColumns));
+  /**
+   * Writes a sorted chunk to disk.
+   *
+   * @param array $chunk
+   *   The chunk of records.
+   * @param array $sort_columns
+   *   The sort columns.
+   * @param array $headers
+   *   The headers.
+   *
+   * @return string
+   *   The path to the temporary file.
+   */
+  private function writeSortedChunk(array $chunk, array $sort_columns, array $headers): string {
+    usort($chunk, fn($a, $b) => $this->compareRecords($a, $b, $sort_columns));
 
-    $tempFile = $this->createTempFile();
+    $temp_file = $this->createTempFile();
 
     // Use 'w' mode with fopen + from.
-    $writer = Writer::from(fopen($tempFile, 'w'));
+    $writer = Writer::from(fopen($temp_file, 'w'));
 
     // Write headers to the chunk so the Merge phase can read keys.
     $writer->insertOne($headers);
     $writer->insertAll($chunk);
 
     $this->metrics->chunksCreated++;
-    $this->tempFiles[] = $tempFile;
+    $this->tempFiles[] = $temp_file;
 
-    return $tempFile;
+    return $temp_file;
   }
 
-  private function mergeChunks(array $chunkFiles, array $sortColumns, array $headers): string
-  {
-    if (count($chunkFiles) === 1) {
-      return $chunkFiles[0];
+  /**
+   * Merges sorted chunks.
+   *
+   * @param array $chunk_files
+   *   The chunk files to merge.
+   * @param array $sort_columns
+   *   The sort columns.
+   * @param array $headers
+   *   The headers.
+   *
+   * @return string
+   *   The path to the final merged file.
+   */
+  private function mergeChunks(array $chunk_files, array $sort_columns, array $headers): string {
+    if (count($chunk_files) === 1) {
+      return $chunk_files[0];
     }
 
-    while (count($chunkFiles) > 1) {
-      $mergedChunks = [];
-      foreach (array_chunk($chunkFiles, $this->mergeFactor) as $group) {
-        $mergedChunks[] = $this->kWayMerge($group, $sortColumns, $headers);
+    while (count($chunk_files) > 1) {
+      $merged_chunks = [];
+      foreach (array_chunk($chunk_files, $this->mergeFactor) as $group) {
+        $merged_chunks[] = $this->kWayMerge($group, $sort_columns, $headers);
       }
-      $chunkFiles = $mergedChunks;
+      $chunk_files = $merged_chunks;
       $this->metrics->mergePasses++;
     }
 
-    return $chunkFiles[0];
+    return $chunk_files[0];
   }
 
-  private function kWayMerge(array $files, array $sortColumns, array $headers): string
-  {
+  /**
+   * Performs a k-way merge on a set of files.
+   *
+   * @param array $files
+   *   The files to merge.
+   * @param array $sort_columns
+   *   The sort columns.
+   * @param array $headers
+   *   The headers.
+   *
+   * @return string
+   *   The path to the merged file.
+   */
+  private function kWayMerge(array $files, array $sort_columns, array $headers): string {
     $readers = [];
     $heap = new \SplMinHeap();
 
@@ -304,13 +451,13 @@ class ExternalSorter
         $heap->insert([
           'record' => $record,
           'index' => $index,
-          'priority' => $this->calculatePriority($record, $sortColumns),
+          'priority' => $this->calculatePriority($record, $sort_columns),
         ]);
       }
     }
 
-    $outputFile = $this->createTempFile();
-    $writer = Writer::from(fopen($outputFile, 'w'));
+    $output_file = $this->createTempFile();
+    $writer = Writer::from(fopen($output_file, 'w'));
 
     // Write headers to final output for application.
     $writer->insertOne($headers);
@@ -327,22 +474,34 @@ class ExternalSorter
         $heap->insert([
           'record' => $record,
           'index' => $index,
-          'priority' => $this->calculatePriority($record, $sortColumns),
+          'priority' => $this->calculatePriority($record, $sort_columns),
         ]);
       }
     }
 
-    $this->tempFiles[] = $outputFile;
-    return $outputFile;
+    $this->tempFiles[] = $output_file;
+    return $output_file;
   }
 
-  private function compareRecords(array $a, array $b, array $sortColumns): int
-  {
-    foreach ($sortColumns as $column) {
-      $valueA = $a[$column->name] ?? '';
-      $valueB = $b[$column->name] ?? '';
+  /**
+   * Compares two records.
+   *
+   * @param array $a
+   *   Record A.
+   * @param array $b
+   *   Record B.
+   * @param array $sort_columns
+   *   The sort columns.
+   *
+   * @return int
+   *   The comparison result.
+   */
+  private function compareRecords(array $a, array $b, array $sort_columns): int {
+    foreach ($sort_columns as $column) {
+      $value_a = $a[$column->name] ?? '';
+      $value_b = $b[$column->name] ?? '';
 
-      $comparison = $column->comparator->compare($valueA, $valueB);
+      $comparison = $column->comparator->compare($value_a, $value_b);
 
       if ($comparison !== 0) {
         return $comparison * $column->direction->multiplier();
@@ -351,27 +510,48 @@ class ExternalSorter
     return 0;
   }
 
-  private function calculatePriority(array $record, array $sortColumns): string
-  {
+  /**
+   * Calculates the priority for the heap.
+   *
+   * @param array $record
+   *   The record.
+   * @param array $sort_columns
+   *   The sort columns.
+   *
+   * @return string
+   *   The priority string.
+   */
+  private function calculatePriority(array $record, array $sort_columns): string {
     $parts = [];
-    foreach ($sortColumns as $column) {
+    foreach ($sort_columns as $column) {
       $parts[] = $record[$column->name] ?? '';
     }
     return implode('|', $parts);
   }
 
-  private function createTempFile(): string
-  {
-    $tempFile = tempnam($this->tempDir, 'csvsort_');
-    if ($tempFile === false) {
+  /**
+   * Creates a temporary file.
+   *
+   * @return string
+   *   The path to the temporary file.
+   *
+   * @throws \Andileco\CsvSort\Exception\IoException
+   */
+  private function createTempFile(): string {
+    $temp_file = tempnam($this->tempDir, 'csvsort_');
+    if ($temp_file === FALSE) {
       throw new IoException("Failed to create temporary file in {$this->tempDir}");
     }
     $this->metrics->tempFilesCreated++;
-    return $tempFile;
+    return $temp_file;
   }
 
-  private function validateConfiguration(): void
-  {
+  /**
+   * Validates the configuration.
+   *
+   * @throws \Andileco\CsvSort\Exception\InvalidConfigurationException
+   */
+  private function validateConfiguration(): void {
     if ($this->chunkSize < 1) {
       throw new InvalidConfigurationException("Chunk size must be > 0");
     }
@@ -383,8 +563,10 @@ class ExternalSorter
     }
   }
 
-  private function cleanup(): void
-  {
+  /**
+   * Cleans up temporary files.
+   */
+  private function cleanup(): void {
     foreach ($this->tempFiles as $file) {
       if (file_exists($file)) {
         @unlink($file);
@@ -392,4 +574,5 @@ class ExternalSorter
     }
     $this->tempFiles = [];
   }
+
 }

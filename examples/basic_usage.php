@@ -15,31 +15,33 @@ use Andileco\CsvSort\Comparator\NumericComparator;
 use League\Csv\Reader;
 use League\Csv\Writer;
 
-// Create a sample CSV file
+// Create a sample CSV file.
 $sampleFile = __DIR__ . '/sample.csv';
 $writer = Writer::createFromPath($sampleFile, 'w');
 $writer->insertOne(['name', 'age', 'city']);
 $writer->insertAll([
-    ['Alice', '30', 'New York'],
-    ['Bob', '25', 'Los Angeles'],
-    ['Charlie', '35', 'Chicago'],
-    ['Diana', '28', 'Houston'],
-    ['Eve', '32', 'Phoenix'],
+  ['Alice', '30', 'New York'],
+  ['Bob', '25', 'Los Angeles'],
+  ['Charlie', '35', 'Chicago'],
+  ['Diana', '28', 'Houston'],
+  ['Eve', '32', 'Phoenix'],
 ]);
 
 echo "Sample CSV created: $sampleFile\n\n";
 
-// Example 1: Simple sort by name
+// Example 1: Simple sort by name.
 echo "=== Example 1: Sort by name (ascending) ===\n";
 $reader = Reader::createFromPath($sampleFile, 'r');
 $reader->setHeaderOffset(0);
 
-// Default configuration (Chunk size: 5000 rows, Merge Factor: 10)
+// Default configuration (Chunk size: 50,000 rows, Merge Factor: 50).
+// Will automatically use in-memory sort if file size is below
+// threshold (default 20MB)
 $sorter = new ExternalSorter();
 $sorted = $sorter->sort($reader, 'name');
 
 foreach ($sorted as $record) {
-    echo "{$record['name']}, {$record['age']}, {$record['city']}\n";
+  echo "{$record['name']}, {$record['age']}, {$record['city']}\n";
 }
 
 $metrics = $sorter->getMetrics();
@@ -53,56 +55,59 @@ $reader->setHeaderOffset(0);
 
 $sorter = new ExternalSorter();
 $sorted = $sorter->sort(
-    $reader,
-    new SortColumn('age', SortDirection::DESC, new NumericComparator())
+  $reader,
+  new SortColumn('age', SortDirection::DESC, new NumericComparator())
 );
 
 foreach ($sorted as $record) {
-    echo "{$record['name']}, {$record['age']}, {$record['city']}\n";
+  echo "{$record['name']}, {$record['age']}, {$record['city']}\n";
 }
 echo "\n";
 
-// Example 3: Multi-column sort
+// Example 3: Multi-column sort.
 echo "=== Example 3: Sort by city (asc), then age (desc) ===\n";
 $reader = Reader::createFromPath($sampleFile, 'r');
 $reader->setHeaderOffset(0);
 
 $sorter = new ExternalSorter();
 $sorted = $sorter->sort($reader, [
-    new SortColumn('city', SortDirection::ASC),
-    new SortColumn('age', SortDirection::DESC, new NumericComparator()),
+  new SortColumn('city', SortDirection::ASC),
+  new SortColumn('age', SortDirection::DESC, new NumericComparator()),
 ]);
 
 foreach ($sorted as $record) {
-    echo "{$record['city']}, {$record['name']}, {$record['age']}\n";
+  echo "{$record['city']}, {$record['name']}, {$record['age']}\n";
 }
 echo "\n";
 
-// Example 4: High Performance Configuration (For Large Files)
+// Example 4: High Performance Configuration (For Large Files).
 echo "=== Example 4: Large File Configuration ===\n";
 $reader = Reader::createFromPath($sampleFile, 'r');
 $reader->setHeaderOffset(0);
 
-// Use larger chunks and higher merge factor to reduce Disk I/O on massive files
+// Use larger chunks and higher merge factor to reduce Disk I/O on massive
+// files. You can also adjust 'memory_sort_threshold' to control when disk
+// sorting kicks in.
 $sorter = new ExternalSorter([
-    'chunk_size' => 50000, // Process 50k rows at a time (vs default 5k)
-    'merge_factor' => 50,  // Merge 50 temp files at once (vs default 10)
-    'temp_dir' => sys_get_temp_dir(),
+  'chunk_size' => 100000,
+  'merge_factor' => 20,
+  'memory_sort_threshold' => 10485760,
+  'temp_dir' => sys_get_temp_dir(),
 ]);
 
 $sorted = $sorter->sort($reader, 'name');
 
 echo "Sorted using optimized large-file settings.\n";
 foreach ($sorted as $record) {
-    // Just printing first match to prove it works
-    echo "First record: {$record['name']}\n";
-    break;
+  // Just printing first match to prove it works.
+  echo "First record: {$record['name']}\n";
+  break;
 }
 echo "\n";
 
-// Clean up
+// Clean up.
 if (file_exists($sampleFile)) {
-    unlink($sampleFile);
+  unlink($sampleFile);
 }
 
 echo "Done! Check the output above.\n";

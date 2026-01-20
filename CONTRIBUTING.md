@@ -55,7 +55,7 @@ composer analyse
 
 ## Coding Standards
 
-- Follow PSR-12 coding style
+- Follow Drupal coding style
 - Use strict types (`declare(strict_types=1);`)
 - Add type hints for all parameters and return values
 - Write clear, self-documenting code
